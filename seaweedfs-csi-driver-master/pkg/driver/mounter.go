@@ -1,0 +1,232 @@
+package driver
+
+import (
+	"fmt"
+	"path"
+	"strconv"
+	"strings"
+
+	"github.com/seaweedfs/seaweedfs-csi-driver/pkg/datalocality"
+	"github.com/seaweedfs/seaweedfs-csi-driver/pkg/mountmanager"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+)
+
+type Unmounter interface {
+	Unmount() error
+}
+
+type Mounter interface {
+	Mount(target string) (Unmounter, error)
+}
+
+type mountServiceMounter struct {
+	driver     *SeaweedFsDriver
+	volumeID   string
+	readOnly   bool
+	volContext map[string]string
+	client     *mountmanager.Client
+}
+
+type mountServiceUnmounter struct {
+	client   *mountmanager.Client
+	volumeID string
+}
+
+func newMounter(volumeID string, readOnly bool, driver *SeaweedFsDriver, volContext map[string]string) (Mounter, error) {
+	client, err := mountmanager.NewClient(driver.mountEndpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	contextCopy := make(map[string]string, len(volContext))
+	for k, v := range volContext {
+		contextCopy[k] = v
+	}
+
+	return &mountServiceMounter{
+		driver:     driver,
+		volumeID:   volumeID,
+		readOnly:   readOnly,
+		volContext: contextCopy,
+		client:     client,
+	}, nil
+}
+
+func (m *mountServiceMounter) Mount(target string) (Unmounter, error) {
+	if target == "" {
+		return nil, fmt.Errorf("target path is required")
+	}
+
+	filers := make([]string, len(m.driver.filers))
+	for i, address := range m.driver.filers {
+		filers[i] = string(address)
+	}
+
+	cacheDir := GetCacheDir(m.driver.CacheDir, m.volumeID)
+	localSocket := GetLocalSocket(m.driver.volumeSocketDir, m.volumeID)
+
+	args, err := m.buildMountArgs(target, cacheDir, localSocket, filers)
+	if err != nil {
+		return nil, err
+	}
+
+	req := &mountmanager.MountRequest{
+		VolumeID:    m.volumeID,
+		TargetPath:  target,
+		CacheDir:    cacheDir,
+		MountArgs:   args,
+		LocalSocket: localSocket,
+	}
+
+	_, err = m.client.Mount(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return &mountServiceUnmounter{
+		client:   m.client,
+		volumeID: m.volumeID,
+	}, nil
+}
+
+func (u *mountServiceUnmounter) Unmount() error {
+	_, err := u.client.Unmount(&mountmanager.UnmountRequest{VolumeID: u.volumeID})
+	return err
+}
+
+func (m *mountServiceMounter) buildMountArgs(targetPath, cacheDir, localSocket string, filers []string) ([]string, error) {
+	volumeContext := m.volContext
+	if volumeContext == nil {
+		volumeContext = map[string]string{}
+	}
+
+	var filerPath string
+	if path.IsAbs(m.volumeID) {
+		// path already resolved in controller and passed as volumeID
+		filerPath = m.volumeID
+	} else {
+		// non-absolute-path volume ID, volume is either legacy or this is a static provision
+		contextPath := volumeContext["path"]
+		if contextPath == "" {
+			// Backward-compatibility for legacy volume ID
+			filerPath = path.Join("/buckets", m.volumeID)
+		} else {
+			// This is a static provision
+			// Always use the context path parameter as filerPath
+			filerPath = contextPath
+		}
+	}
+
+	collection := volumeContext["collection"]
+	if collection == "" {
+		// Use path basename when collection is not set
+		collection = path.Base(filerPath)
+	}
+
+	args := []string{
+		"-logtostderr=true",
+		"mount",
+		"-dirAutoCreate=true",
+		"-umask=000",
+		fmt.Sprintf("-dir=%s", targetPath),
+		fmt.Sprintf("-localSocket=%s", localSocket),
+		fmt.Sprintf("-cacheDir=%s", cacheDir),
+	}
+
+	if m.readOnly {
+		args = append(args, "-readOnly")
+	}
+
+	argsMap := map[string]string{
+		"collection":         collection,
+		"collectionQuotaMB":  initialCollectionQuotaMB(volumeContext[volumeCapacityKey]),
+		"filer":              strings.Join(filers, ","),
+		"filer.path":         filerPath,
+		"cacheCapacityMB":    strconv.Itoa(m.driver.CacheCapacityMB),
+		"cacheMetaTtlSec":    strconv.Itoa(m.driver.CacheMetaTtlSec),
+		"concurrentReaders":  strconv.Itoa(m.driver.ConcurrentReaders),
+		"concurrentWriters":  strconv.Itoa(m.driver.ConcurrentWriters),
+		"map.uid":            m.driver.UidMap,
+		"map.gid":            m.driver.GidMap,
+		"disk":               "",
+		"dataCenter":         "",
+		"replication":        "",
+		"ttl":                "",
+		"chunkSizeLimitMB":   "",
+		"volumeServerAccess": "",
+		"readRetryTime":      "",
+	}
+
+	dataLocality := m.driver.DataLocality
+	if contextLocality, ok := volumeContext["dataLocality"]; ok && contextLocality != "" {
+		if dl, ok := datalocality.FromString(contextLocality); ok {
+			dataLocality = dl
+		} else {
+			return nil, fmt.Errorf("invalid volumeContext dataLocality: %s", contextLocality)
+		}
+	}
+
+	dataCenter := m.driver.DataCenter
+	if err := CheckDataLocality(&dataLocality, &dataCenter); err != nil {
+		return nil, err
+	}
+
+	switch dataLocality {
+	case datalocality.Write_preferLocalDc:
+		argsMap["dataCenter"] = dataCenter
+	}
+
+	parameterArgMap := map[string]string{
+		"uidMap":   "map.uid",
+		"gidMap":   "map.gid",
+		"diskType": "disk",
+	}
+
+	ignoredArgs := map[string]struct{}{
+		"collectionQuotaMB": {},
+		"dataLocality":      {},
+		"path":              {},
+		"parentDir":         {},
+		"volumeName":        {},
+		volumeCapacityKey:   {},
+	}
+
+	for key, value := range volumeContext {
+		if _, ignored := ignoredArgs[key]; ignored {
+			continue
+		}
+		if mapped, ok := parameterArgMap[key]; ok {
+			key = mapped
+		}
+		if _, ok := argsMap[key]; !ok {
+			glog.Warningf("VolumeContext '%s' ignored", key)
+			continue
+		}
+		if value != "" {
+			argsMap[key] = value
+		}
+	}
+
+	for key, value := range argsMap {
+		if value == "" {
+			continue
+		}
+		args = append(args, fmt.Sprintf("-%s=%s", key, value))
+	}
+
+	return args, nil
+}
+
+func initialCollectionQuotaMB(capacityBytes string) string {
+	capacity, err := strconv.ParseInt(capacityBytes, 10, 64)
+	if err != nil || capacity <= 1 {
+		return ""
+	}
+
+	const bytesPerMiB = int64(1024 * 1024)
+	capacityMB := capacity / bytesPerMiB
+	if capacity%bytesPerMiB != 0 {
+		capacityMB++
+	}
+	return strconv.FormatInt(capacityMB, 10)
+}

@@ -1,0 +1,20 @@
+# SeaweedFS 运行时数据
+filerldb2/
+
+# 脚本生成文件
+.kind-config-generated.yaml
+.csi-driver-patched.yaml
+.nfs_s3_rclone_template.yaml
+.nfs_s3_rclone_rendered.yaml
+
+# fio 测试结果
+fio-results/
+
+# Docker 镜像 (本地构建)
+# *.tar
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

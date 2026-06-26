@@ -1,0 +1,242 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nfs-client-provisioner
+  namespace: kube-system
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: nfs-client-provisioner-runner
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # 👈 核心修复：直接在全局授予对 endpoints 的所有控制权
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # 👈 核心修复：顺便授予新版 K8s 强依赖的协调锁（Lease）权限
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: run-nfs-client-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-client-provisioner
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: nfs-client-provisioner-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-locking-nfs-client-provisioner
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"] # 新版 K8s 常用 leases 作为选主锁
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-locking-nfs-client-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-client-provisioner
+    namespace: kube-system
+roleRef:
+  kind: Role
+  name: leader-locking-nfs-client-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+# 1. 部署 Provisioner 控制器 Pod
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-client-provisioner
+  namespace: kube-system
+  labels:
+    app: nfs-client-provisioner
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nfs-client-provisioner
+  template:
+    metadata:
+      labels:
+        app: nfs-client-provisioner
+    spec:
+      serviceAccountName: nfs-client-provisioner
+      containers:
+        - name: nfs-client-provisioner
+          # 使用社区广泛维护的开源镜像
+          image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
+          volumeMounts:
+            - name: nfs-client-root
+              mountPath: /persistentvolumes
+          env:
+            - name: PROVISIONER_NAME
+              value: seaweedfs/nfs-provisioner # 必须与 StorageClass 的 provisioner 一致
+            - name: NFS_SERVER
+              value: 10.10.33.122 # ⚠️ 改为你的 SeaweedFS NFS 宿主机IP
+            - name: NFS_PATH
+              value: /mnt/seaweedfs/data/
+      volumes:
+        - name: nfs-client-root
+          nfs:
+            server: 10.10.33.122 # ⚠️ 改为你的 SeaweedFS NFS 宿主机IP
+            path: /mnt/seaweedfs/data/
+---
+# 2. 创建 StorageClass (存储类)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: seaweedfs-nfs-storage
+provisioner: seaweedfs/nfs-provisioner # 匹配 Deployment 中的 PROVISIONER_NAME
+reclaimPolicy: Delete # PVC删除时自动删除SeaweedFS里的数据（可改为 Retain 保留）
+volumeBindingMode: Immediate
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-nfs-pvc
+spec:
+  storageClassName: seaweedfs-nfs-storage # 👈 核心：加上这一行，指明让 SeaweedFS NFS 接管
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-storage-test
+  labels:
+    app: nginx-storage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-storage
+  template:
+    metadata:
+      labels:
+        app: nginx-storage
+    spec:
+      containers:
+        # 1. 主容器：Nginx，同时挂载 NFS 和 S3 共享目录
+        - name: nginx
+          image: nginx:alpine
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: nfs-volume
+              mountPath: /usr/share/nginx/html/nfs # NFS 挂载点
+            - name: s3-shared-volume
+              mountPath: /usr/share/nginx/html/s3 # S3 挂载点
+              subPath: s3
+              mountPropagation: HostToContainer # 允许接收来自 Sidecar 的挂载传播
+          ports:
+            - containerPort: 80
+
+        # 2. Sidecar 容器：负责利用 rclone 将 SeaweedFS S3 挂载到本地 emptyDir
+        - name: s3-sidecar
+          image: rclone/rclone:v1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true # FUSE 挂载需要特权
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "umount -f /data/s3"]
+          #  👇 核心修复：用 command 强制指定为 /bin/sh，彻底干掉镜像自带的 rclone 引导
+          command: ["/bin/sh"]
+          args:
+            - -c
+            - |
+              # 延迟 3 秒，确保系统准备好
+              sleep 3
+
+              umount -l /data/s3 || true
+              # 创建存储桶
+              rclone mkdir sw_s3:my-test-bucket
+
+              # 挂载（移除最外层的 &，让它在前台阻塞运行，K8s 喜欢前台进程）
+              rclone mount sw_s3:my-test-bucket /data/s3 \
+                --allow-other \
+                --allow-non-empty \
+                --vfs-cache-mode off --no-modtime &
+
+              # 给挂载腾出 2 秒准备时间
+              sleep 2
+
+              # c. 核心自愈循环：高频单向 sync
+              echo "🚀 激活常驻单向同步守护流（S3 -> NFS，1秒轮询）..."
+              while true; do
+                # 执行纯粹的单向同步
+                # --modify-window 2s 依然保留，用来完美抹平 S3 和 NFS 之间的毫秒级时间流失
+                rclone sync sw_s3:my-test-bucket /data/nfs \
+                --create-empty-src-dirs \
+                --modify-window 2s \
+                --update \
+                -v
+                
+                # 每隔 1 秒同步一次，你可以根据实际需要调整为 2s 或 5s
+                sleep 5
+              done
+
+          env:
+            - name: RCLONE_CONFIG_SW_S3_TYPE
+              value: s3
+            - name: RCLONE_CONFIG_SW_S3_PROVIDER
+              value: Other
+            - name: RCLONE_CONFIG_SW_S3_ENDPOINT
+              value: "http://10.10.33.122:8333" # SeaweedFS S3 地址
+            - name: RCLONE_CONFIG_SW_S3_ENV_AUTH
+              value: "true"
+            - name: RCLONE_CONFIG_SW_S3_ACCESS_KEY_ID
+              value: "admin"
+            - name: RCLONE_CONFIG_SW_S3_SECRET_ACCESS_KEY
+              value: "admin123"
+          volumeMounts:
+            - name: s3-shared-volume
+              mountPath: /data
+              mountPropagation: Bidirectional # 👈 必须：双向传播，将 FUSE 挂载点扩散给 Nginx
+            # 👈 核心修改：让 Sidecar 也能看到并操作同一个 NFS PVC 物理目录
+            - name: nfs-volume
+              mountPath: /data/nfs
+
+      volumes:
+        - name: nfs-volume
+          persistentVolumeClaim:
+            claimName: seaweedfs-nfs-pvc
+        - name: s3-shared-volume
+          emptyDir:
+            medium: Memory

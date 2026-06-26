@@ -1,0 +1,21 @@
+# SeaweedFS 实验环境 fio 测试容器
+# 基于 Alpine，预装 fio + jq + python3，启动后自动测试并生成 HTML 报告
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    fio \
+    jq \
+    python3 \
+    bash \
+    curl \
+    coreutils
+
+# 预创建挂载点目录和结果目录
+RUN mkdir -p /mnt/nfs /mnt/s3 /mnt/s3_with_seaweedfs /tmp/fio-results/data
+
+# 自动测试入口脚本
+COPY entrypoint-fio.sh /entrypoint-fio.sh
+RUN chmod +x /entrypoint-fio.sh
+
+# 启动 → 等待挂载 → 三场景 fio 测试 → 生成 TXT+HTML 报告 → 保持运行
+ENTRYPOINT ["/entrypoint-fio.sh"]
