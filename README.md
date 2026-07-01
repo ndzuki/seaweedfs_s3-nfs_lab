@@ -185,7 +185,8 @@ KIND_CLUSTER_NAME=seaweedfs-exp2 sudo -E ./setup-seaweedfs-lab.sh deploy
 │  │  │  │ /mnt/nfs      │  │ /data/s3 ← S3 FUSE   │        │     │   │
 │  │  │  │ /mnt/s3       │  │ /data/nfs → NFS PVC  │        │     │   │
 │  │  │  │ /mnt/s3_with_ │  │   sync loop          │        │     │   │
-│  │  │  │   seaweedfs   │  └──────────────────────┘        │     │   │
+│  │  │  │   seaweedfs    │  │                      │        │     │   │
+│  │  │  │ /mnt/image 🔒   │  └──────────────────────┘        │     │   │
 │  │  │  └──────────────┘                                   │     │   │
 │  │  └────────────────────────────────────────────────────┘     │   │
 │  └─────────────────────────────────────────────────────────────┘   │
