@@ -747,6 +747,13 @@ tr:hover{background:#1c2535}
 .summary-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:24px;font-size:13px;color:#8b949e}
 .summary-box strong{color:#c9d1d9}
 .csi-tag{display:inline-block;background:#1a3a2a;color:#3fb950;font-size:11px;padding:1px 6px;border-radius:3px;margin-left:4px}
+.host-info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-bottom:24px}
+.host-info-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px 16px}
+.host-info-card h4{color:#79c0ff;margin:0 0 10px;font-size:13px;border-bottom:1px solid #30363d;padding-bottom:6px}
+.host-info-card table{width:100%;border-collapse:collapse;font-size:12px;margin:0}
+.host-info-card td{padding:3px 8px 3px 0;border:none;color:#8b949e}
+.host-info-card td+td{color:#c9d1d9;text-align:right;font-family:monospace;font-size:11px}
+.host-info-card tr:nth-child(even){background:transparent}
 </style></head><body>
 <h1>🌿 SeaweedFS fio 性能基准报告</h1>
 <h2>__TIMESTAMP__</h2>
@@ -783,6 +790,46 @@ __BODY__
 HTMLEOF
 
 sed -i "s/__TIMESTAMP__/$(date)/" "$HTML_FILE"
+
+# ============================================================
+# 收集主机配置信息 (硬件 + 系统 + 内核参数)
+# ============================================================
+cat > "${DATA_DIR}/host-info.json" << HOSTEOF
+{
+  "timestamp": "$(date -Iseconds)",
+  "hardware": {
+    "cpu_model": "$(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo 'N/A')",
+    "cpu_cores": "$(nproc 2>/dev/null || echo 'N/A')",
+    "memory_total": "$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{printf "%.1f GB", $2/1048576}' || echo 'N/A')",
+    "memory_available": "$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{printf "%.1f GB", $2/1048576}' || echo 'N/A')",
+    "disk_mounts": "$(df -h /mnt/nfs /mnt/s3 /mnt/s3_with_seaweedfs /mnt/image 2>/dev/null | tail -4 | awk '{print $6, $2, $3}' | paste -sd ';' - || echo 'N/A')"
+  },
+  "system": {
+    "kernel": "$(uname -r 2>/dev/null || echo 'N/A')",
+    "os": "$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"' || echo 'N/A')",
+    "hostname": "$(hostname 2>/dev/null || echo 'N/A')"
+  },
+  "kernel_params": {
+    "fs.file-max": "$(cat /proc/sys/fs/file-max 2>/dev/null || echo 'N/A')",
+    "fs.nfs.nfs_congestion_kb": "$(cat /proc/sys/fs/nfs/nfs_congestion_kb 2>/dev/null || echo 'N/A')",
+    "vm.dirty_bytes": "$(cat /proc/sys/vm/dirty_bytes 2>/dev/null || echo 'N/A')",
+    "vm.dirty_background_bytes": "$(cat /proc/sys/vm/dirty_background_bytes 2>/dev/null || echo 'N/A')",
+    "net.core.rmem_max": "$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo 'N/A')",
+    "net.core.wmem_max": "$(cat /proc/sys/net/core/wmem_max 2>/dev/null || echo 'N/A')"
+  },
+  "test_config": {
+    "AI_MODEL_SIZE": "${AI_MODEL_SIZE}",
+    "TEST_SIZE": "${TEST_SIZE}",
+    "SMALL_FILE_COUNT": "${SMALL_FILE_COUNT}",
+    "SMALL_FILE_SIZE": "${SMALL_FILE_SIZE}",
+    "CSI_WRITE_RATE": "${CSI_WRITE_RATE}",
+    "FIO_MEMORY_LIMIT": "${FIO_MEMORY_LIMIT:-未设置}",
+    "RCLONE_MEMORY_LIMIT": "${RCLONE_MEMORY_LIMIT:-未设置}",
+    "WEED_MOUNT_CACHE_MB": "${WEED_MOUNT_CACHE_MB:-未设置}",
+    "CSI_CONCURRENT_WRITERS": "${CSI_CONCURRENT_WRITERS:-未设置}"
+  }
+}
+HOSTEOF
 
 # 从 metrics.dat 生成 HTML 表格
 python3 << 'PYEOF'
@@ -898,7 +945,59 @@ def format_cell(value, fmt, best_idx, worst_idx, col_idx):
         cls = ' class="worst"'
     return f'<td{cls}>{value:{fmt}}</td>'
 
-html_body = ''
+# ============================================================
+# 生成主机配置信息段
+# ============================================================
+host_info_html = ''
+host_info_file = os.path.join(data_dir, 'host-info.json')
+if os.path.exists(host_info_file):
+    try:
+        with open(host_info_file) as f:
+            host = json.load(f)
+
+        def kv_row(k, v):
+            return f'<tr><td>{k}</td><td>{v}</td></tr>'
+
+        hw = host.get('hardware', {})
+        sys_info = host.get('system', {})
+        kp = host.get('kernel_params', {})
+        tc = host.get('test_config', {})
+
+        host_info_html += '<h3>🖥️ 实验环境配置</h3>\n<div class="host-info-grid">\n'
+
+        # 硬件信息
+        host_info_html += '<div class="host-info-card"><h4>💻 硬件信息</h4><table>'
+        host_info_html += kv_row('CPU', hw.get('cpu_model', 'N/A'))
+        host_info_html += kv_row('CPU 核心数', str(hw.get('cpu_cores', 'N/A')))
+        host_info_html += kv_row('内存总量', hw.get('memory_total', 'N/A'))
+        host_info_html += kv_row('可用内存', hw.get('memory_available', 'N/A'))
+        host_info_html += '</table></div>\n'
+
+        # 系统信息
+        host_info_html += '<div class="host-info-card"><h4>🐧 系统信息</h4><table>'
+        host_info_html += kv_row('内核版本', sys_info.get('kernel', 'N/A'))
+        host_info_html += kv_row('操作系统', sys_info.get('os', 'N/A'))
+        host_info_html += kv_row('主机名', sys_info.get('hostname', 'N/A'))
+        host_info_html += kv_row('测试时间', host.get('timestamp', 'N/A')[:19])
+        host_info_html += '</table></div>\n'
+
+        # 内核参数
+        host_info_html += '<div class="host-info-card"><h4>⚙️ 内核参数</h4><table>'
+        for k, v in kp.items():
+            host_info_html += kv_row(k, str(v))
+        host_info_html += '</table></div>\n'
+
+        # 测试配置
+        host_info_html += '<div class="host-info-card"><h4>🧪 测试配置</h4><table>'
+        for k, v in tc.items():
+            host_info_html += kv_row(k, str(v))
+        host_info_html += '</table></div>\n'
+
+        host_info_html += '</div>\n'
+    except Exception as e:
+        host_info_html = f'<!-- Host info generation failed: {e} -->\n'
+
+html_body = host_info_html
 for scenario_title, prefix, scenario_desc in SCENARIOS:
     test_keys = [k for k in sorted(tests) if k.startswith(prefix)]
     if not test_keys:
