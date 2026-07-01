@@ -1,0 +1,30 @@
+# SeaweedFS 实验环境 — ImageVolume 测试数据镜像
+# 预置只读测试数据: 基础读写文件 + 小文件 + AI 模型
+# 用于 ImageVolume 只读性能对比 (vs NFS / S3 rclone / CSI)
+FROM alpine:3.20
+
+RUN mkdir -p /small_files /ai_model && \
+    echo ">>> 生成 256M 基础读取文件..." && \
+    dd if=/dev/zero of=/basic_read.dat bs=1M count=256 2>/dev/null && \
+    echo ">>> 生成 256M 基础随机读取文件..." && \
+    dd if=/dev/zero of=/basic_randread.dat bs=1M count=256 2>/dev/null && \
+    echo ">>> 生成 512M AI 模型文件..." && \
+    dd if=/dev/zero of=/ai_model/ckpt.dat bs=1M count=512 2>/dev/null && \
+    echo ">>> 生成 ${SMALL_FILE_COUNT:-2000} 个 ${SMALL_FILE_SIZE:-16k} 小文件..." && \
+    for i in $(seq 0 1999); do \
+        dd if=/dev/zero of="/small_files/fio_small_${i}.dat" bs=16k count=1 2>/dev/null; \
+    done && \
+    echo ">>> 测试数据生成完成:" && \
+    echo "  $(du -sh /basic_read.dat)" && \
+    echo "  $(du -sh /basic_randread.dat)" && \
+    echo "  $(du -sh /ai_model/ckpt.dat)" && \
+    echo "  $(ls /small_files/ | wc -l) 个小文件 ($(du -sh /small_files/ | cut -f1))"
+
+# 验证: 所有文件存在且大小正确
+RUN set -e; \
+    test -s /basic_read.dat || (echo "ERROR: basic_read.dat missing" && exit 1); \
+    test -s /basic_randread.dat || (echo "ERROR: basic_randread.dat missing" && exit 1); \
+    test -s /ai_model/ckpt.dat || (echo "ERROR: ai_model/ckpt.dat missing" && exit 1); \
+    count=$(ls /small_files/fio_small_*.dat 2>/dev/null | wc -l); \
+    test "$count" -eq 2000 || (echo "ERROR: small files count=$count, expected 2000" && exit 1); \
+    echo "✓ 所有测试数据验证通过"

@@ -52,8 +52,8 @@ export SEAWEEDFS_S3_SECRET_KEY="${SEAWEEDFS_S3_SECRET_KEY:-admin123}"
 
 # ---- NFS 配置 ----
 export NFS_SERVER="${NFS_SERVER:-${LOCAL_IP}}"
-export NFS_PATH="${NFS_PATH:-/mnt/seaweedfs/data}"
-export WEED_MOUNT_CACHE_MB="${WEED_MOUNT_CACHE_MB:-256}"
+export NFS_PATH="${NFS_PATH:-/mnt/seaweedfs/nfs}"
+export WEED_MOUNT_CACHE_MB="${WEED_MOUNT_CACHE_MB:-1024}" # weed mount 读缓存 (增大以缓存 512M 模型)
 
 # ---- Kind 集群 ----
 export KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-seaweedfs-lab}"
@@ -72,11 +72,13 @@ fi
 export REAL_USER REAL_HOME
 export KUBECONFIG_FILE="${KUBECONFIG_FILE:-${REAL_HOME}/.kube/config}"
 
+export BUSYBOX_IMAGE="${BUSYBOX_IMAGE:-busybox:1.36}"
+
 # ---- CSI Driver ----
 export CSI_DRIVER_VERSION="${CSI_DRIVER_VERSION:-v1.4.22}"
 export CSI_DRIVER_IMAGE="${CSI_DRIVER_IMAGE:-chrislusf/seaweedfs-csi-driver:${CSI_DRIVER_VERSION}}"
 export CSI_MOUNT_IMAGE="${CSI_MOUNT_IMAGE:-chrislusf/seaweedfs-mount:${CSI_DRIVER_VERSION}}"
-export CSI_CACHE_CAPACITY_MB="${CSI_CACHE_CAPACITY_MB:-256}"
+export CSI_CONCURRENT_WRITERS="${CSI_CONCURRENT_WRITERS:-128}"  # CSI 并发写入 (max 128, 默认已最优)
 export CSI_PROVISIONER_IMAGE="${CSI_PROVISIONER_IMAGE:-registry.k8s.io/sig-storage/csi-provisioner:v3.5.0}"
 export CSI_RESIZER_IMAGE="${CSI_RESIZER_IMAGE:-registry.k8s.io/sig-storage/csi-resizer:v1.8.0}"
 export CSI_ATTACHER_IMAGE="${CSI_ATTACHER_IMAGE:-registry.k8s.io/sig-storage/csi-attacher:v4.3.0}"
@@ -95,8 +97,12 @@ export FIO_REPORT_HOST="${FIO_REPORT_HOST:-report.local.com}"
 export S3_BUCKET="${S3_BUCKET:-my-test-bucket}"
 
 # ---- fio 测试镜像 ----
-export FIO_IMAGE_TAG="${FIO_IMAGE_TAG:-local}"
+export FIO_IMAGE_TAG="${FIO_IMAGE_TAG:-local-$(date +%Y%m%d%H%M%S)}"
 export FIO_IMAGE="${FIO_IMAGE:-seaweedfs-fio-test:${FIO_IMAGE_TAG}}"
+export FIO_IMAGE_VOLUME="${FIO_IMAGE_VOLUME:-seaweedfs-test-data:latest}"
+
+# ---- ImageVolume 测试数据镜像 ----
+export TESTDATA_IMAGE="${TESTDATA_IMAGE:-seaweedfs-test-data:local}"
 
 # ---- fio 测试参数 ----
 export FIO_SIZE="${FIO_SIZE:-256M}"
@@ -110,7 +116,6 @@ export TEST_AI_MODEL="${TEST_AI_MODEL:-true}"
 # ---- 小文件场景参数 ----
 export SMALL_FILE_COUNT="${SMALL_FILE_COUNT:-2000}"
 export SMALL_FILE_SIZE="${SMALL_FILE_SIZE:-16k}"
-export SMALL_FILE_RUNTIME="${SMALL_FILE_RUNTIME:-120s}"
 export NFS_CACHE_WAIT="${NFS_CACHE_WAIT:-0}"
 
 # ---- AI 大模型场景参数 ----
@@ -118,11 +123,19 @@ export AI_MODEL_SIZE="${AI_MODEL_SIZE:-512M}"
 export AI_MODEL_RUNTIME="${AI_MODEL_RUNTIME:-120s}"
 export AI_MODEL_JOBS="${AI_MODEL_JOBS:-4}"
 
+# ---- fio Pod 资源限制 ----
+export FIO_MEMORY_LIMIT="${FIO_MEMORY_LIMIT:-1536Mi}"
+export FIO_CPU_LIMIT="${FIO_CPU_LIMIT:-2}"
+export RCLONE_MEMORY_LIMIT="${RCLONE_MEMORY_LIMIT:-2560Mi}" # full cache 2G + overhead
+export RCLONE_CPU_LIMIT="${RCLONE_CPU_LIMIT:-2}"
+
 # ---- 基础路径 ----
 BASE_DIR="/mnt/seaweedfs"
+# DATA_DIR: weed 内部数据 (master/volume/filer) — 真实文件系统，不在 FUSE 挂载下
 DATA_DIR="${BASE_DIR}/data"
 LOG_DIR="${BASE_DIR}/logs"
-NFS_MOUNT="${BASE_DIR}/data"
+# NFS_MOUNT: FUSE 挂载点 + NFS 导出 — 必须与 DATA_DIR 分离，避免循环依赖
+NFS_MOUNT="${BASE_DIR}/nfs"
 
 # ---- 颜色输出 ----
 GREEN='\033[0;32m'
@@ -182,10 +195,11 @@ safe_envsubst() {
 			NFS_SERVER NFS_PATH S3_BUCKET KIND_CLUSTER_NAME \
 			FIO_IMAGE NGINX_IMAGE FIO_REPORT_HOST \
 			TEST_BASIC TEST_SMALL_FILES TEST_AI_MODEL \
-			SMALL_FILE_COUNT SMALL_FILE_SIZE SMALL_FILE_RUNTIME \
-				NFS_CACHE_WAIT \
+			SMALL_FILE_COUNT SMALL_FILE_SIZE \
+			NFS_CACHE_WAIT \
 			AI_MODEL_SIZE AI_MODEL_RUNTIME AI_MODEL_JOBS \
-			FIO_SIZE FIO_RUNTIME; do
+			FIO_SIZE FIO_RUNTIME \
+			FIO_MEMORY_LIMIT FIO_CPU_LIMIT RCLONE_MEMORY_LIMIT RCLONE_CPU_LIMIT; do
 			content="${content//\$\{${var}\}/$(eval echo "\$$var")}"
 		done
 		echo "$content"
@@ -219,6 +233,8 @@ generate_kind_config() {
 apiVersion: kind.x-k8s.io/v1alpha4
 kind: Cluster
 name: ${KIND_CLUSTER_NAME}
+featureGates:
+  "ImageVolume": true
 nodes:
   - role: control-plane
     # 移除 control-plane taint，允许 Pod 调度到该节点
@@ -379,18 +395,43 @@ deploy_seaweedfs_services() {
 		return 1
 	fi
 
-	# 检查是否已运行
-	if ps aux | grep "weed master" | grep -v grep &>/dev/null; then
+	# 检查是否已运行 (检测所有 weed 组件，不仅 master)
+	if ps aux | grep -E "weed (master|volume|filer|s3)" | grep -v grep &>/dev/null; then
 		log_warn "SeaweedFS 服务已在运行中。如需重启请先执行 uninstall。"
 		return 0
 	fi
 
-	# 1. 创建目录
+	# 主动清理 /tmp 下的 weed volume 残留文件 (CWD 降级产生)
+	local tmp_weed_files
+	tmp_weed_files=$(find /tmp -maxdepth 1 \( -name '[0-9]*.dat' -o -name '[0-9]*.idx' -o -name '[0-9]*.vif' \) -user root 2>/dev/null | wc -l)
+	if [ "$tmp_weed_files" -gt 0 ]; then
+		log_warn "检测到 /tmp 下有 ${tmp_weed_files} 个 weed volume 残留文件"
+		log_info "  清理 /tmp 下的 volume 数据文件..."
+		find /tmp -maxdepth 1 \( -name '[0-9]*.dat' -o -name '[0-9]*.idx' -o -name '[0-9]*.vif' \) -user root -delete 2>/dev/null || true
+		log_info "  已清理 (这些文件是 weed volume 降级到 CWD 时产生的)"
+	fi
+
+	# 1. 创建目录 (含 tmpfs 安全检查)
 	log_info "创建环境目录..."
+	# 确保 BASE_DIR 父目录存在
+	mkdir -p "$(dirname "${BASE_DIR}")" 2>/dev/null || true
 	mkdir -p "${DATA_DIR}/master" "${DATA_DIR}/volume" "${DATA_DIR}/filer"
 	mkdir -p "${LOG_DIR}" "${NFS_MOUNT}"
+	# CSI 缓存目录 (hostPath, 宿主机磁盘持久化)
+	mkdir -p /var/cache/seaweedfs 2>/dev/null || true
 	chmod -R 777 "${BASE_DIR}"
 	chmod 777 "${NFS_MOUNT}"
+
+	# 安全检查: volume 数据目录不得在 tmpfs 上 (否则吃内存)
+	local vol_fs
+	vol_fs=$(df -T "${DATA_DIR}/volume" 2>/dev/null | awk 'NR==2{print $2}')
+	if [ "$vol_fs" = "tmpfs" ]; then
+		log_error "✗ ${DATA_DIR}/volume 在 tmpfs 上! 会导致内存爆满。"
+		log_error "  请设置 BASE_DIR 到真实磁盘路径 (当前: ${BASE_DIR})"
+		log_error "  例如: BASE_DIR=/data/seaweedfs $0 deploy"
+		return 1
+	fi
+	log_info "volume 数据目录: ${DATA_DIR}/volume (文件系统: ${vol_fs:-未知})"
 
 	# 2. 安装 NFS 依赖
 	log_info "检查并安装 NFS 依赖..."
@@ -413,38 +454,49 @@ deploy_seaweedfs_services() {
 		echo "user_allow_other" >/etc/fuse.conf
 	fi
 
-	# 4. 启动 Master
+	# 3b. 宿主机内核调优 (FUSE + 海量小文件 + 高吞吐网络)
+	log_info "配置内核参数 (FUSE/网络/文件句柄优化)..."
+	sysctl -w fs.file-max=2097152 2>/dev/null || true
+	sysctl -w fs.nr_open=2097152 2>/dev/null || true
+	sysctl -w net.core.rmem_max=16777216 2>/dev/null || true
+	sysctl -w net.core.wmem_max=16777216 2>/dev/null || true
+	sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" 2>/dev/null || true
+	sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" 2>/dev/null || true
+	sysctl -w vm.max_map_count=262144 2>/dev/null || true
+
+	# 4. 启动 Master (CWD 保护: cd 到数据目录，防止降级写入 /tmp)
 	log_info "启动 Master (${SEAWEEDFS_MASTER})..."
-	nohup weed master \
+	(cd "${DATA_DIR}/master" && nohup weed master \
 		-ip="${LOCAL_IP}" \
 		-port=9333 \
-		\t -port.grpc=19333 \
+		-port.grpc=19333 \
 		-mdir="${DATA_DIR}/master" \
 		-volumeSizeLimitMB=10240 \
 		-volumePreallocate \
-		>"${LOG_DIR}/master.log" 2>&1 &
+		>"${LOG_DIR}/master.log" 2>&1 &)
 	sleep 2
 
-	# 5. 启动 Volume
+	# 5. 启动 Volume (CWD 保护: cd 到数据目录，-dir 失败时降级到 /mnt/seaweedfs 而不是 /tmp)
 	log_info "启动 Volume (${LOCAL_IP}:8080)..."
-	nohup weed volume \
+	(cd "${DATA_DIR}/volume" && nohup weed volume \
 		-mserver="${SEAWEEDFS_MASTER}" \
 		-ip="${LOCAL_IP}" \
 		-port=8080 \
-		\t -port.grpc=18080 \
+		-port.grpc=18080 \
 		-dir="${DATA_DIR}/volume" \
 		-images.fix.orientation=false \
-		>"${LOG_DIR}/volume.log" 2>&1 &
+		>"${LOG_DIR}/volume.log" 2>&1 &)
 	sleep 2
 
-	# 6. 启动 Filer
+	# 6. 启动 Filer (元数据写入 DATA_DIR/filer, 确保不在 /tmp)
 	log_info "启动 Filer (${SEAWEEDFS_FILER})..."
-	nohup weed filer \
+	# cd 到目标目录再启动，确保 LevelDB filerldb2 落在正确位置
+	(cd "${DATA_DIR}/filer" && nohup weed filer \
 		-master="${SEAWEEDFS_MASTER}" \
 		-ip="${LOCAL_IP}" \
 		-port=8888 \
 		-port.grpc=18888 \
-		>"${LOG_DIR}/filer.log" 2>&1 &
+		>"${LOG_DIR}/filer.log" 2>&1 &)
 	sleep 2
 
 	# 7. 启动 S3 API
@@ -458,6 +510,30 @@ deploy_seaweedfs_services() {
 		>"${LOG_DIR}/s3.log" 2>&1 &
 	sleep 2
 
+	# 启动后验证: 确保 volume 数据文件写入正确目录，未泄漏到 /tmp
+	log_info "验证 volume 数据目录..."
+	local vol_dat_count
+	vol_dat_count=$(find "${DATA_DIR}/volume" -name '*.dat' -type f 2>/dev/null | wc -l)
+	if [ "$vol_dat_count" -gt 0 ]; then
+		log_info "  ✓ volume 数据目录正常: ${DATA_DIR}/volume (已有 ${vol_dat_count} 个 .dat 文件)"
+	else
+		log_warn "  ⚠️ volume 数据目录暂无 .dat 文件 (新集群首次启动正常)"
+	fi
+	# 主动检查 /tmp 是否有新泄漏
+	local tmp_leak
+	tmp_leak=$(find /tmp -maxdepth 1 \( -name '[0-9]*.dat' -o -name '[0-9]*.idx' -o -name '[0-9]*.vif' \) -user root -newer "${LOG_DIR}/volume.log" 2>/dev/null | wc -l)
+	if [ "$tmp_leak" -gt 0 ]; then
+		log_error "✗ 检测到 /tmp 下有 ${tmp_leak} 个新的 volume 数据文件! CWD 降级可能已发生。"
+		log_error "  文件列表:"
+		find /tmp -maxdepth 1 \( -name '[0-9]*.dat' -o -name '[0-9]*.idx' -o -name '[0-9]*.vif' \) -user root -newer "${LOG_DIR}/volume.log" -ls 2>/dev/null | while IFS= read -r l; do log_error "    ${l}"; done
+		log_error "  立即清理并检查 volume 进程..."
+		find /tmp -maxdepth 1 \( -name '[0-9]*.dat' -o -name '[0-9]*.idx' -o -name '[0-9]*.vif' \) -user root -delete 2>/dev/null || true
+		# 检查 weed volume 进程状态
+		if ! pgrep -f "weed volume" >/dev/null 2>&1; then
+			log_error "  weed volume 进程不存在! 请检查日志: ${LOG_DIR}/volume.log"
+		fi
+	fi
+
 	# 8. FUSE mount (Filer → 本地目录)
 	log_info "FUSE 挂载 Filer → ${NFS_MOUNT}..."
 	umount -l "${NFS_MOUNT}" 2>/dev/null || true
@@ -468,15 +544,16 @@ deploy_seaweedfs_services() {
 		nohup weed mount \
 			-filer="${SEAWEEDFS_FILER}" \
 			-dir="${NFS_MOUNT}" \
-			-cacheCapacityMB="${WEED_MOUNT_CACHE_MB:-256}" \
+			-cacheCapacityMB="${WEED_MOUNT_CACHE_MB:-1024}" \
 			>"${LOG_DIR}/mount.log" 2>&1 &
 		local mount_pid=$!
 		# 等待时间递增: 3s → 5s → 8s
-		local wait_time=$(( attempt * 2 + 1 ))
+		local wait_time=$((attempt * 2 + 1))
 		sleep "${wait_time}"
 		if mountpoint -q "${NFS_MOUNT}" 2>/dev/null; then
 			log_info "FUSE 挂载成功: ${NFS_MOUNT}"
-			mount_ok=1; break
+			mount_ok=1
+			break
 		fi
 		# 检查进程是否存活
 		if ! kill -0 "${mount_pid}" 2>/dev/null; then
@@ -496,8 +573,9 @@ deploy_seaweedfs_services() {
 	sed -i '\#^/mnt/seaweedfs#d' /etc/exports 2>/dev/null || true
 	# 每次重写而非追加，避免重复条目累积
 	cat >>/etc/exports <<EOF
-${NFS_MOUNT} 172.16.0.0/12(rw,sync,no_subtree_check,fsid=1,no_root_squash,insecure)
-${NFS_MOUNT} 10.0.0.0/8(rw,sync,no_subtree_check,fsid=1,no_root_squash,insecure)
+# NFS v4.2: async 替代 sync 大幅提升写入性能 (数据安全由 SeaweedFS 保证)
+${NFS_MOUNT} 172.16.0.0/12(rw,async,no_wdelay,no_subtree_check,fsid=1,no_root_squash,insecure)
+${NFS_MOUNT} 10.0.0.0/8(rw,async,no_wdelay,no_subtree_check,fsid=1,no_root_squash,insecure)
 EOF
 
 	# 10. 重启 NFS 服务
@@ -512,6 +590,12 @@ EOF
 		service nfs-kernel-server restart 2>/dev/null || service nfs-server restart 2>/dev/null || true
 	fi
 	exportfs -rav 2>/dev/null || true
+
+	# NFS async 模式内存保护: NFS 拥塞窗口 + 脏页上限 (需 > AI_MODEL_SIZE)
+	log_info "配置 NFS 内存保护 (async 脏页上限)..."
+	sysctl -w fs.nfs.nfs_congestion_kb=131072 2>/dev/null || true      # 128MB NFS 拥塞窗口
+	sysctl -w vm.dirty_background_bytes=1073741824 2>/dev/null || true # 1GB 后台刷盘
+	sysctl -w vm.dirty_bytes=2147483648 2>/dev/null || true            # 2GB 硬上限 (须 > 512M AI 写)
 
 	log_info "SeaweedFS 服务部署完成！"
 	echo "  Filer Web : http://${SEAWEEDFS_FILER}"
@@ -545,10 +629,10 @@ deploy_csi_driver() {
 	# 需要替换为实际的 filer 地址
 	local tmp_yaml="${SCRIPT_DIR}/.csi-driver-patched.yaml"
 
-	log_info "替换 CSI driver 配置: filer=${SEAWEEDFS_FILER}, cache=${CSI_CACHE_CAPACITY_MB}MB, version=${CSI_DRIVER_VERSION}"
+	log_info "替换 CSI driver 配置: filer=${SEAWEEDFS_FILER}, concurrentWriters=${CSI_CONCURRENT_WRITERS:-128}, version=${CSI_DRIVER_VERSION}"
 	sed -e "s|value: \"SEAWEEDFS_FILER:8888\"|value: \"${SEAWEEDFS_FILER}\"|g" \
 		-e "s|SEAWEEDFS_FILER:8888|${SEAWEEDFS_FILER}|g" \
-		-e "s|--cacheCapacityMB=[0-9]*|--cacheCapacityMB=${CSI_CACHE_CAPACITY_MB}|g" \
+		-e "s|--concurrentWriters=[0-9]*|--concurrentWriters=${CSI_CONCURRENT_WRITERS:-128}|g" \
 		-e "s|image: chrislusf/seaweedfs-csi-driver:.*|image: ${CSI_DRIVER_IMAGE}|g" \
 		-e "s|image: chrislusf/seaweedfs-mount:.*|image: ${CSI_MOUNT_IMAGE}|g" \
 		"$csi_yaml" >"$tmp_yaml"
@@ -580,15 +664,22 @@ preload_images() {
 		log_error "Dockerfile 不存在: ${dockerfile}"
 		return 1
 	fi
-	if docker image inspect "${FIO_IMAGE}" &>/dev/null; then
-		log_detail "跳过构建: ${FIO_IMAGE} (已存在)"
+	# 始终重新构建 (本地开发镜像，确保使用最新 entrypoint-fio.sh)
+	log_info "构建: ${FIO_IMAGE} ..."
+	docker build -t "${FIO_IMAGE}" -f "$dockerfile" "${SCRIPT_DIR}/docker"
+
+	# ---- 1b. 构建 ImageVolume 测试数据镜像 ----
+	local testdata_dockerfile="${SCRIPT_DIR}/docker/Dockerfile.testdata"
+	if [ -f "$testdata_dockerfile" ]; then
+		log_info "构建: ${TESTDATA_IMAGE} (ImageVolume 只读测试数据)..."
+		docker build -t "${TESTDATA_IMAGE}" -f "$testdata_dockerfile" "${SCRIPT_DIR}/docker"
 	else
-		log_info "构建: ${FIO_IMAGE} ..."
-		docker build -t "${FIO_IMAGE}" -f "$dockerfile" "${SCRIPT_DIR}/docker"
+		log_warn "跳过: ${testdata_dockerfile} 不存在, ImageVolume 不可用"
 	fi
 
 	# ---- 2. 拉取 CSI / NFS / rclone 等外部镜像 ----
 	local images=(
+		"${BUSYBOX_IMAGE}"
 		"${CSI_DRIVER_IMAGE}"
 		"${CSI_MOUNT_IMAGE}"
 		"${CSI_PROVISIONER_IMAGE}"
@@ -614,7 +705,12 @@ preload_images() {
 
 	# ---- 3. 批量导入 kind 节点 ----
 	log_info "导入镜像到 kind 节点..."
-	kind load docker-image "${FIO_IMAGE}" --name "${KIND_CLUSTER_NAME}"
+	kind load docker-image "${FIO_IMAGE}" --name "${KIND_CLUSTER_NAME}" || log_warn "导入 FIO 镜像失败: ${FIO_IMAGE}"
+	# ImageVolume 测试数据镜像
+	if docker image inspect "${TESTDATA_IMAGE}" &>/dev/null; then
+		log_detail "导入: ${TESTDATA_IMAGE}"
+		kind load docker-image "${TESTDATA_IMAGE}" --name "${KIND_CLUSTER_NAME}" || log_warn "导入 testdata 镜像失败: ${TESTDATA_IMAGE}"
+	fi
 	for img in "${images[@]}"; do
 		if docker image inspect "$img" &>/dev/null; then
 			log_detail "导入: ${img}"
@@ -622,7 +718,7 @@ preload_images() {
 		fi
 	done
 
-	log_info "所有镜像预加载完成 (1 构建 + ${#images[@]} 导入)。"
+	log_info "所有镜像预加载完成。"
 }
 
 # 兼容旧函数名
@@ -749,6 +845,8 @@ spec:
               value: "${NFS_SERVER}"
             - name: NFS_PATH
               value: "${NFS_PATH}"
+            - name: NFS_MOUNT_OPTIONS
+              value: "nfsvers=4.2,rsize=1048576,wsize=1048576,noatime,nodiratime,hard,nocto"
       volumes:
         - name: nfs-client-root
           nfs:
@@ -763,6 +861,12 @@ metadata:
 provisioner: seaweedfs/nfs-provisioner
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
+mountOptions:
+  - nfsvers=4.2
+  - rsize=1048576
+  - wsize=1048576
+  - noatime
+  - hard
 ---
 # NFS PVC
 apiVersion: v1
@@ -822,6 +926,9 @@ spec:
             - name: s3-csi-volume
               mountPath: /mnt/s3_with_seaweedfs
               mountPropagation: HostToContainer
+            - name: image-volume
+              mountPath: /mnt/image
+              readOnly: true
             - name: results-volume
               mountPath: /tmp/fio-results
           env:
@@ -842,8 +949,6 @@ spec:
               value: "${SMALL_FILE_COUNT}"
             - name: SMALL_FILE_SIZE
               value: "${SMALL_FILE_SIZE}"
-            - name: SMALL_FILE_RUNTIME
-              value: "${SMALL_FILE_RUNTIME}"
             - name: NFS_CACHE_WAIT
               value: "${NFS_CACHE_WAIT}"
             # AI 大模型场景
@@ -853,6 +958,13 @@ spec:
               value: "${AI_MODEL_RUNTIME}"
             - name: AI_MODEL_JOBS
               value: "${AI_MODEL_JOBS}"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "${FIO_MEMORY_LIMIT}"
+              cpu: "${FIO_CPU_LIMIT}"
 
         # Nginx: 静态文件服务，暴露 fio 测试结果 HTML
         - name: nginx
@@ -868,6 +980,13 @@ spec:
           volumeMounts:
             - name: results-volume
               mountPath: /usr/share/nginx/html
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
 
         # Sidecar: rclone S3 挂载 + 同步
         - name: s3-sidecar
@@ -890,10 +1009,19 @@ spec:
               rclone mkdir sw_s3:${S3_BUCKET} 2>/dev/null || true
 
               # 前台 FUSE 挂载 S3 → /data/s3
+              # rclone VFS 优化参数 (内存预算: ~1.5G/4jobs)
               rclone mount sw_s3:${S3_BUCKET} /data/s3 \
                 --allow-other \
                 --allow-non-empty \
                 --vfs-cache-mode full \
+                --vfs-cache-max-size 2048M \
+                --vfs-cache-max-age 1h \
+                --cache-dir /data/rclone-cache \
+                --vfs-read-ahead 128M \
+                --vfs-read-chunk-size 64M \
+                --vfs-read-chunk-size-limit 128M \
+                --buffer-size 32M \
+                --vfs-write-back 10s \
                 --no-modtime &
 
               sleep 2
@@ -926,17 +1054,27 @@ spec:
               mountPropagation: Bidirectional
             - name: nfs-volume
               mountPath: /data/nfs
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "${RCLONE_MEMORY_LIMIT}"
+              cpu: "${RCLONE_CPU_LIMIT}"
 
       volumes:
         - name: nfs-volume
           persistentVolumeClaim:
             claimName: seaweedfs-nfs-pvc
         - name: s3-shared-volume
-          emptyDir:
-            medium: Memory
+          emptyDir: {}
         - name: s3-csi-volume
           persistentVolumeClaim:
             claimName: seaweedfs-csi-pvc
+        - name: image-volume
+          image:
+            reference: ${TESTDATA_IMAGE}
+            pullPolicy: IfNotPresent
         - name: results-volume
           emptyDir: {}
 TMPLEOF
@@ -1004,62 +1142,60 @@ EOF
 		done || true
 	fi
 
+	log_info "NFS/S3/rclone CRDs 部署完成。"
+	kubectl get pods -A 2>/dev/null | grep -E 'nfs-client-provisioner|fio-storage' || true
 
-		# 诊断 kind 容器 → 宿主机 weed 服务连通性 (volume server 端口不可达会导致 CSI 测试失败)
-		check_kind_host_connectivity
+	# 诊断 kind 容器内是否能连通宿主机 weed 服务的关键端口
+	# 若 volume server 端口不可达，CSI 挂载的 fio 数据写入会失败
+	check_kind_host_connectivity() {
+		log_step "诊断 kind → 宿主机 weed 服务连通性"
 
-		log_info "NFS/S3/rclone CRDs 部署完成。"
-		kubectl get pods -A 2>/dev/null | grep -E 'nfs-client-provisioner|fio-storage' || true
+		local filer_ip="${SEAWEEDFS_FILER%:*}"
 
-# 诊断 kind 容器内是否能连通宿主机 weed 服务的关键端口
-# 若 volume server 端口不可达，CSI 挂载的 fio 数据写入会失败
-check_kind_host_connectivity() {
-	log_step "诊断 kind → 宿主机 weed 服务连通性"
+		log_info "从 kind 容器内测试 TCP 连通性到 ${filer_ip}..."
 
-	local filer_ip="${SEAWEEDFS_FILER%:*}"
+		# --rm -i: Pod 完成后自动删除; stdout 直接捕获输出，无需 kubectl logs
+		local result
+		result=$(kubectl run connectivity-check --rm -i --restart=Never --image=busybox:1.36 \
+			-- sh -c "
+	for port in 8888 18888 8080 18080 8333; do
+	    if timeout 3 nc -z ${filer_ip} \$port 2>/dev/null; then
+	        echo \"OK:\$port\"
+	    else
+	        echo \"FAIL:\$port\"
+	    fi
+	done
+	" 2>/dev/null) || true
 
-	log_info "从 kind 容器内测试 TCP 连通性到 ${filer_ip}..."
-
-	kubectl run connectivity-check --rm -i --restart=Never --image=busybox:1.36 \
-		-- sh -c "
-for port in 8888 18888 8080 18080 8333; do
-    if timeout 3 nc -z ${filer_ip} \$port 2>/dev/null; then
-        echo \"OK:\$port\"
-    else
-        echo \"FAIL:\$port\"
-    fi
-done
-" 2>/dev/null || true
-
-	local result
-	result=$(kubectl logs connectivity-check 2>/dev/null || true)
-	kubectl delete pod connectivity-check --force --grace-period=0 2>/dev/null || true
-
-	if [ -n "$result" ]; then
-		echo "$result" | while IFS= read -r line; do
-			case "$line" in
-				*OK:*)   log_info "  🟢 ${line#*OK:}" ;;
+		if [ -n "$result" ]; then
+			echo "$result" | while IFS= read -r line; do
+				case "$line" in
+				*OK:*) log_info "  🟢 ${line#*OK:}" ;;
 				*FAIL:*) log_warn "  🔴 ${line#*FAIL:} — 端口不可达!" ;;
-			esac
-		done
+				esac
+			done
 
-		if echo "$result" | grep -q "FAIL:8080\|FAIL:18080"; then
-			echo ""
-			log_warn "================================================"
-			log_warn "  ⚠️  volume server 端口从 kind 不可达!"
-			log_warn "  CSI 挂载 (s3_with_seaweedfs) 的 fio 数据写入将失败。"
-			log_warn ""
-			log_warn "  修复方案 (选择其一):"
-			log_warn "  1. 放行防火墙:"
-			log_warn "     iptables -I INPUT -p tcp --dport 8080 -j ACCEPT"
-			log_warn "     iptables -I INPUT -p tcp --dport 18080 -j ACCEPT"
-			log_warn "  2. 让 weed 监听所有接口:"
-			log_warn "     将 volume 启动命令的 -ip 改为 0.0.0.0"
-			log_warn "================================================"
-			echo ""
+			if echo "$result" | grep -q "FAIL:8080\|FAIL:18080"; then
+				echo ""
+				log_warn "================================================"
+				log_warn "  ⚠️  volume server 端口从 kind 不可达!"
+				log_warn "  CSI 挂载 (s3_with_seaweedfs) 的 fio 数据写入将失败。"
+				log_warn ""
+				log_warn "  修复方案 (选择其一):"
+				log_warn "  1. 放行防火墙:"
+				log_warn "     iptables -I INPUT -p tcp --dport 8080 -j ACCEPT"
+				log_warn "     iptables -I INPUT -p tcp --dport 18080 -j ACCEPT"
+				log_warn "  2. 让 weed 监听所有接口:"
+				log_warn "     将 volume 启动命令的 -ip 改为 0.0.0.0"
+				log_warn "================================================"
+				echo ""
+			fi
 		fi
-	fi
-}
+	}
+
+	# 诊断 kind 容器 → 宿主机 weed 服务连通性
+	check_kind_host_connectivity
+
 }
 
 # ============================================================
@@ -1287,8 +1423,12 @@ uninstall_all() {
 	if [[ "$del_data" == "y" || "$del_data" == "Y" ]]; then
 		log_info "删除宿主机数据目录: ${BASE_DIR} ..."
 		rm -rf "${BASE_DIR}"
-		log_info "删除项目内 Filer 数据: ${SCRIPT_DIR}/filerldb2 ..."
+		log_info "删除旧版遗留 Filer 数据: ${SCRIPT_DIR}/filerldb2 ..."
 		rm -rf "${SCRIPT_DIR}/filerldb2"
+		# 清理 /tmp 下可能遗留的 volume 数据文件 (weed volume 降级到 CWD 时产生)
+		log_info "清理 /tmp 下遗留的 volume 数据文件..."
+		find /tmp -maxdepth 1 \( -name '[0-9]*.dat' -o -name '[0-9]*.idx' -o -name '[0-9]*.vif' -o -name 'pvc-*.dat' -o -name 'pvc-*.idx' -o -name 'pvc-*.vif' \) -user root -delete 2>/dev/null || true
+		log_info "  ✓ 已清理所有 volume 残留文件 (.dat / .idx / .vif)"
 	else
 		log_info "保留数据目录: ${BASE_DIR}"
 		log_info "保留 Filer 数据: ${SCRIPT_DIR}/filerldb2"
@@ -1386,7 +1526,7 @@ print_usage() {
 	echo "  SEAWEEDFS_S3_ENDPOINT=${SEAWEEDFS_S3_ENDPOINT}"
 	echo "  KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME}"
 	echo "  FIO_IMAGE=${FIO_IMAGE}"
-	echo "  CSI_CACHE_CAPACITY_MB=${CSI_CACHE_CAPACITY_MB}"
+	echo "  CSI_CONCURRENT_WRITERS=${CSI_CONCURRENT_WRITERS:-128}"
 	echo "  FIO_SIZE=${FIO_SIZE}  FIO_RUNTIME=${FIO_RUNTIME}"
 	echo "  SMALL_FILE_COUNT=${SMALL_FILE_COUNT}  SMALL_FILE_SIZE=${SMALL_FILE_SIZE}"
 	echo "  AI_MODEL_SIZE=${AI_MODEL_SIZE}  AI_MODEL_JOBS=${AI_MODEL_JOBS}"

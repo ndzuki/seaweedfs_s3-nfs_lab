@@ -8,7 +8,8 @@ RUN apk add --no-cache \
     python3 \
     bash \
     curl \
-    coreutils
+    coreutils \
+    util-linux
 
 # 预创建挂载点目录和结果目录
 RUN mkdir -p /mnt/nfs /mnt/s3 /mnt/s3_with_seaweedfs /tmp/fio-results/data

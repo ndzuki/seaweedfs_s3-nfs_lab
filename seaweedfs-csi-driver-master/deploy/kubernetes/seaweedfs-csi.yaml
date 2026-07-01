@@ -20,6 +20,12 @@ metadata:
 provisioner: seaweedfs-csi-driver
 allowVolumeExpansion: true
 volumeBindingMode: Immediate
+mountOptions:
+  - noatime
+parameters:
+  concurrentWriters: "32"
+  chunkSizeLimitMB: "16"
+  cacheCapacityMB: "1024"
 ---
 # Source: seaweedfs-csi-driver/templates/rbac.yaml
 kind: ClusterRole
@@ -250,7 +256,9 @@ spec:
           hostPath:
             path: /dev
         - name: cache
-          emptyDir: {}
+          hostPath:
+            path: /var/cache/seaweedfs
+            type: DirectoryOrCreate
         - name: mount-socket-dir
           hostPath:
             path: /var/lib/seaweedfs-mount
@@ -298,7 +306,7 @@ spec:
             - --driverName=$(DRIVER_NAME)
             - --mountEndpoint=$(MOUNT_ENDPOINT)
             - --cacheDir=/var/cache/seaweedfs
-            - --cacheCapacityMB=256
+            - --concurrentWriters=128
             - --components=node
           env:
             - name: CSI_ENDPOINT
@@ -415,7 +423,9 @@ spec:
           hostPath:
             path: /dev
         - name: cache
-          emptyDir: {}
+          hostPath:
+            path: /var/cache/seaweedfs
+            type: DirectoryOrCreate
         - name: mount-socket-dir
           hostPath:
             path: /var/lib/seaweedfs-mount
@@ -526,7 +536,7 @@ spec:
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
           ports:
             - containerPort: 9810
-              name: healthz-resizer
+              name: healthz
           livenessProbe:
             httpGet:
               path: /healthz/leader-election
@@ -537,7 +547,7 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
-          resources: 
+          resources:
             {}
         # attacher
         - name: csi-attacher
@@ -553,7 +563,7 @@ spec:
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
           ports:
             - containerPort: 9811
-              name: healthz-attacher
+              name: healthz
           livenessProbe:
             httpGet:
               path: /healthz/leader-election

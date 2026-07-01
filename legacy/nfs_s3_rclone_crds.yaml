@@ -238,5 +238,4 @@ spec:
           persistentVolumeClaim:
             claimName: seaweedfs-nfs-pvc
         - name: s3-shared-volume
-          emptyDir:
-            medium: Memory
+          emptyDir: {}
