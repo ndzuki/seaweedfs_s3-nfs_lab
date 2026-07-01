@@ -559,9 +559,18 @@ sys.stderr.write(f'\r  NFS files: {count} created in {elapsed:.0f}s (NFS O_RDONL
         sync 2>/dev/null || true; sleep 1
         echo "$(( $(date +%s) - s ))s" | tee -a "$RESULT_FILE"
 
+        # NFS 属性缓存检测: 文件创建成功后目录可能立即不可见 (NFS over FUSE 已知问题)
+        local nfs_dir_broken=false
+        if [ "$dn" = "nfs" ] && ! ls "$sd" >/dev/null 2>&1; then
+            nfs_dir_broken=true
+            echo "     ⚠️ NFS 目录不可访问 (属性缓存)" | tee -a "$RESULT_FILE"
+        fi
+
         # 随机读 (所有挂载类型通用)
         echo -n "    随机读(4k,4jobs):" | tee -a "$RESULT_FILE"
-        if [ "$dn" = "nfs" ]; then
+        if $nfs_dir_broken; then
+            echo " ⏭ NFS 缓存" | tee -a "$RESULT_FILE"
+        elif [ "$dn" = "nfs" ]; then
             run_fio "small-randread-${dn}" --directory="$sd" --rw=randrw --rwmixread=99 --bs=4k \
                 --numjobs=4 --nrfiles=$SMALL_FILE_COUNT --filesize=$SMALL_FILE_SIZE --size=8M \
                 --filename_format='fio_small_$filenum.dat' --file_service_type=sequential \
@@ -583,6 +592,8 @@ sys.stderr.write(f'\r  NFS files: {count} created in {elapsed:.0f}s (NFS O_RDONL
         echo -n "    随机写(4k,4jobs):" | tee -a "$RESULT_FILE"
         if [ "$dn" = "image" ]; then
             echo " ⏭ 只读" | tee -a "$RESULT_FILE"
+        elif $nfs_dir_broken; then
+            echo " ⏭ NFS 缓存" | tee -a "$RESULT_FILE"
         elif [ "$dn" = "s3_with_seaweedfs" ]; then
             run_fio_csi_safe_write "small-randwrite-${dn}" --directory="$sd" --rw=randwrite --bs=4k \
                 --numjobs=4 --nrfiles=$SMALL_FILE_COUNT --filesize=$SMALL_FILE_SIZE --size=8M \
@@ -599,6 +610,8 @@ sys.stderr.write(f'\r  NFS files: {count} created in {elapsed:.0f}s (NFS O_RDONL
         echo -n "    混合rw(70r30w):" | tee -a "$RESULT_FILE"
         if [ "$dn" = "image" ]; then
             echo " ⏭ 只读" | tee -a "$RESULT_FILE"
+        elif $nfs_dir_broken; then
+            echo " ⏭ NFS 缓存" | tee -a "$RESULT_FILE"
         elif [ "$dn" = "s3_with_seaweedfs" ]; then
             run_fio_csi_safe_write "small-randrw-${dn}" --directory="$sd" --rw=randrw --rwmixread=70 --bs=4k \
                 --numjobs=4 --nrfiles=$SMALL_FILE_COUNT --filesize=$SMALL_FILE_SIZE --size=8M \
