@@ -560,7 +560,7 @@ sys.stderr.write(f'\r  NFS files: {count} created in {elapsed:.0f}s (NFS O_RDONL
         echo "$(( $(date +%s) - s ))s" | tee -a "$RESULT_FILE"
 
         # NFS 属性缓存检测: 文件创建成功后目录可能立即不可见 (NFS over FUSE 已知问题)
-        local nfs_dir_broken=false
+        nfs_dir_broken=false
         if [ "$dn" = "nfs" ] && ! ls "$sd" >/dev/null 2>&1; then
             nfs_dir_broken=true
             echo "     ⚠️ NFS 目录不可访问 (属性缓存)" | tee -a "$RESULT_FILE"
