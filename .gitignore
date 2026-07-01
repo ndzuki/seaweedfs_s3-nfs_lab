@@ -18,3 +18,5 @@ fio-results/
 .vscode/
 *.swp
 *.swo
+findings.json
+filerldb2/
