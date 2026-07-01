@@ -1,7 +1,7 @@
 # 🌿 SeaweedFS 实验环境
 
-一键部署 **kind 集群 + SeaweedFS 存储服务 + CSI Driver + NFS/S3/rclone** 的本地实验环境，
-并自动执行 **fio 基准测试**（基础读写 / 2000+ 小文件 / AI 大模型）对比 NFS、S3 FUSE、CSI 三种挂载方式的性能。
+一键部署 **kind 集群 + SeaweedFS 存储服务 + CSI Driver + ImageVolume + NFS/S3/rclone** 的本地实验环境，
+并自动执行 **fio 基准测试**（基础读写 / 2000+ 小文件 / AI 大模型）对比 NFS、S3 FUSE、CSI、ImageVolume 四种挂载方式的性能。
 
 ## 目录结构
 
@@ -9,8 +9,9 @@
 .
 ├── setup-seaweedfs-lab.sh          # 主入口脚本 (一键部署/测试/卸载)
 ├── docker/                          # 容器镜像
-│   ├── Dockerfile.fio              # fio 测试容器镜像
-│   └── entrypoint-fio.sh           # 容器启动后自动执行 fio 测试
+│   ├── Dockerfile.fio              # fio 测试容器镜像 (基于 Alpine)
+│   ├── Dockerfile.testdata         # ImageVolume 测试数据镜像 (预置只读数据)
+│   └── entrypoint-fio.sh           # 容器启动后自动执行 fio 四场景测试
 ├── seaweedfs-csi-driver-master/     # SeaweedFS CSI Driver (第三方)
 │   └── deploy/kubernetes/
 │       └── seaweedfs-csi.yaml      # CSI Driver K8s 部署清单
@@ -94,16 +95,44 @@ sudo ./setup-seaweedfs-lab.sh uninstall
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `FIO_IMAGE` | `seaweedfs-fio-test:local` | fio 测试镜像名 |
+| `FIO_IMAGE` | `seaweedfs-fio-test:local-<ts>` | fio 测试镜像名 (时间戳 tag 确保唯一) |
 | `FIO_SIZE` | `256M` | 基础测试文件大小 |
 | `FIO_RUNTIME` | `60s` | 基础测试时长 |
 | `TEST_BASIC` | `true` | 启用基础读写测试 |
 | `TEST_SMALL_FILES` | `true` | 启用小文件场景测试 |
 | `TEST_AI_MODEL` | `true` | 启用 AI 大模型场景测试 |
+| `TEST_SCENARIO` | `all` | 便捷场景选择: `basic`/`small`/`ai`/`all` |
 | `SMALL_FILE_COUNT` | `2000` | 小文件数量 |
 | `SMALL_FILE_SIZE` | `16k` | 单个小文件大小 |
-| `AI_MODEL_SIZE` | `2G` | AI 场景测试文件大小 |
+| `AI_MODEL_SIZE` | `512M` | AI 场景测试文件大小 |
+| `AI_MODEL_RUNTIME` | `120s` | AI 场景读测试时长 |
 | `AI_MODEL_JOBS` | `4` | AI 场景并发线程数 |
+
+### fio 安全与限流参数
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `CSI_WRITE_RATE` | `50m` | CSI 写限速 (MB/s)，防止 FUSE 脏页堆积 OOM |
+| `FIO_TIMEOUT` | `180s` | fio 单次执行超时，防止 FUSE fsync 永久挂起 |
+| `WAIT_TIMEOUT` | `300s` | 挂载点等待超时 |
+| `NFS_CREATE_DELAY` | `0.02` | NFS 小文件创建间隔 (秒/文件) |
+
+### fio Pod 资源限制
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `FIO_MEMORY_LIMIT` | `1536Mi` | fio 容器内存上限 (需 > AI_MODEL_SIZE) |
+| `FIO_CPU_LIMIT` | `2` | fio 容器 CPU 上限 |
+| `RCLONE_MEMORY_LIMIT` | `2560Mi` | rclone 容器内存上限 (含 2G VFS cache) |
+| `RCLONE_CPU_LIMIT` | `2` | rclone 容器 CPU 上限 |
+
+### 性能优化参数
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `WEED_MOUNT_CACHE_MB` | `1024` | weed mount 读缓存 (MB)，增大可缓存热数据 |
+| `CSI_CONCURRENT_WRITERS` | `128` | CSI driver 并发写入线程数 |
+| `NFS_PATH` | `/mnt/seaweedfs/nfs` | NFS 导出路径 |
 
 ### 使用示例
 
@@ -163,13 +192,14 @@ KIND_CLUSTER_NAME=seaweedfs-exp2 sudo -E ./setup-seaweedfs-lab.sh deploy
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 三种挂载路径对比
+### 四种挂载路径对比
 
-| 挂载路径 | 后端 | 存储类 | 特点 |
-|----------|------|--------|------|
-| `/mnt/nfs` | NFS provisioner → 宿主机 NFS | `seaweedfs-nfs-storage` | 标准 NFS 协议，成熟稳定 |
-| `/mnt/s3` | rclone S3 FUSE (sidecar 挂载) | — (emptyDir) | S3 协议，通过 FUSE 模拟 POSIX |
-| `/mnt/s3_with_seaweedfs` | seaweedfs-csi-driver | `seaweedfs-storage` | CSI 接口，K8s 原生集成 |
+| 挂载路径 | 后端 | 存储类 | 读写 | 特点 |
+|----------|------|--------|------|------|
+| `/mnt/nfs` | NFS v4.2 provisioner → 宿主机 NFS | `seaweedfs-nfs-storage` | 读写 | 标准 NFS 协议，async + 1M rsize/wsize，内核态 |
+| `/mnt/s3` | rclone S3 FUSE (sidecar 挂载) | — | 读写 | VFS full cache 2G，read-ahead 128M |
+| `/mnt/s3_with_seaweedfs` | seaweedfs-csi-driver | `seaweedfs-storage` | 读写 | CSI 接口，concurrentWriters=128，hostPath 缓存 |
+| `/mnt/image` | ImageVolume (OCI 镜像) | — | 🔒 只读 | 零拷贝，预填充数据，镜像构建时生成测试文件 |
 
 ### 性能差异分析
 
@@ -209,7 +239,88 @@ S3 rclone (最慢):
 | CSI | ~2000 MB/s | ~500 MB/s | ~200 MB/s | ~8000 IOPS |
 | S3 | ~1500 MB/s | ~1800 MB/s | ~150 MB/s | ~35000 IOPS |
 
-> **结论**: NFS 适合高吞吐和通用场景，CSI 适合 K8s 原生集成（PVC），S3 适合跨平台兼容但性能有折损。选择取决于业务对性能和接口标准的需求。
+> **结论**: NFS 适合高吞吐和通用场景，CSI 适合 K8s 原生集成（PVC），S3 适合跨平台兼容但性能有折损。ImageVolume 为只读场景（模型分发、静态资源）提供零拷贝最优解。选择取决于业务对性能和接口标准的需求。
+
+## ImageVolume 只读测试
+
+通过 Kubernetes ImageVolume 特性，将预置测试数据的 OCI 镜像直接挂载为只读卷，模拟容器镜像分发模型权重或静态资源的场景。
+
+### 构建测试数据镜像
+
+```bash
+sudo docker build -t seaweedfs-test-data:local -f docker/Dockerfile.testdata docker/
+sudo kind load docker-image seaweedfs-test-data:local --name seaweedfs-lab
+```
+
+### 预置数据
+
+| 路径 | 大小 | 用途 |
+|------|------|------|
+| `/basic_read.dat` | 256M | 基础顺序/随机读 |
+| `/basic_randread.dat` | 256M | 基础随机读 |
+| `/small_files/fio_small_*.dat` | 2000×16k | 小文件随机读 |
+| `/ai_model/ckpt.dat` | 512M | AI 模型加载/分布式读 |
+
+### ImageVolume 测试行为
+
+ImageVolume 为只读挂载，fio 测试自动：
+
+| 操作 | 行为 |
+|------|------|
+| 写测试 (顺序/随机/checkpoint/log) | ⏭ 跳过 |
+| 读测试 (顺序/随机/模型加载/分布式) | ✅ 使用预置文件 |
+| 挂载检测 | 9s 快速超时 (不阻塞其他测试) |
+
+### kind 集群启用 ImageVolume
+
+```yaml
+# kind-config.yaml 中添加
+featureGates:
+  ImageVolume: true
+```
+
+## 性能优化配置
+
+### NFS v4.2 优化
+
+| 层级 | 配置 | 效果 |
+|------|------|------|
+| 宿主机 export | `async,no_wdelay` | 异步写入，不等待刷盘 |
+| K8s mount | `nfsvers=4.2,rsize=1M,wsize=1M` | 大块 I/O，减少网络往返 |
+| K8s mount | `noatime,nodiratime,nocto` | 消除元数据开销 |
+| Sysctl | `vm.dirty_bytes=2G` | AI 大文件写入不阻塞 |
+| Sysctl | `fs.nfs.nfs_congestion_kb=128M` | NFS 拥塞窗口 |
+
+### rclone S3 优化
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `--vfs-cache-mode` | `full` | 全缓存模式 |
+| `--vfs-cache-max-size` | `2048M` | 磁盘缓存上限 |
+| `--vfs-read-ahead` | `128M` | 预读缓冲区 |
+| `--buffer-size` | `32M` | 传输缓冲区 |
+| `--cache-dir` | `/data/rclone-cache` | 缓存目录 (emptyDir) |
+
+### CSI (s3_with_seaweedfs) 优化
+
+| 层级 | 配置 | 默认值 |
+|------|------|--------|
+| DaemonSet | `--concurrentWriters=128` | 128 |
+| DaemonSet | `--cacheDir=/var/cache/seaweedfs` | hostPath 持久化 |
+| StorageClass | `mountOptions: [noatime]` | — |
+| 宿主机 | `fs.file-max=2097152` | 海量文件句柄 |
+| 宿主机 | `net.core.rmem_max=16MB` | 大块读缓冲 |
+| 宿主机 | `net.core.wmem_max=16MB` | 大块写缓冲 |
+
+### 内存安全保护
+
+| 机制 | 说明 |
+|------|------|
+| CSI 写限速 `--rate=50m` | 防止 FUSE 脏页堆积 OOM |
+| fio 超时 `timeout 180s` | 防止 FUSE fsync 永久挂起 |
+| run_fio `\|\| true` 保护 | fio 失败不触发 `set -e` 脚本退出 |
+| `run_fio_csi_safe_write` | 自动降级重试，无 fsync |
+| cleanup trap | EXIT 时清理 /tmp 残留 volume 文件 |
 
 ## fio 测试场景
 
@@ -263,9 +374,10 @@ fio --name=test --filename=/mnt/nfs/test.dat --rw=write --bs=1M --size=256M
 
 | 文件 | 说明 |
 |------|------|
-| `setup-seaweedfs-lab.sh` | 主入口脚本，集成 kind 集群创建、SeaweedFS 部署、CSI Driver 部署、fio 测试 |
-| `docker/Dockerfile.fio` | fio 测试容器，基于 Alpine 3.20，预装 fio/bash/curl |
-| `docker/entrypoint-fio.sh` | 容器入口脚本，自动等待挂载点 → 执行三场景测试 → 输出结果 |
+| `setup-seaweedfs-lab.sh` | 主入口脚本，集成 kind 集群创建、SeaweedFS 部署、CSI Driver 部署、ImageVolume、fio 测试 |
+| `docker/Dockerfile.fio` | fio 测试容器，基于 Alpine 3.20，预装 fio/bash/curl/util-linux |
+| `docker/Dockerfile.testdata` | ImageVolume 测试数据镜像，预置 256M/512M 文件和 2000 小文件 |
+| `docker/entrypoint-fio.sh` | 容器入口脚本，自动等待挂载点 → 执行四场景测试 → 生成 HTML 报告 |
 | `legacy/weed-manager.sh` | 旧版脚本，仅管理宿主机上的 weed 进程 |
 | `legacy/nfs_s3_rclone_crds.yaml` | 旧版 CRDs 模板，已内嵌到新脚本中 |
 | `seaweedfs-csi-driver-master/` | SeaweedFS CSI Driver 源码及 K8s 部署清单 |
@@ -340,4 +452,87 @@ kubectl exec $(kubectl get pods -l app=fio-storage -o name) -c fio-test -- /entr
 
 ```bash
 kubectl config use-context kind-seaweedfs-lab
+```
+
+### fio Pod OOMKilled
+
+大文件写入（512M AI checkpoint）会导致 page cache 撑爆容器内存。
+
+```bash
+# 确认 OOM
+kubectl describe pod -l app=fio-storage | grep OOM
+
+# 解决方案 (选其一):
+# 1. 增大 fio 容器内存限制
+FIO_MEMORY_LIMIT=2Gi sudo -E ./setup-seaweedfs-lab.sh crds
+
+# 2. 调小 AI 测试文件
+AI_MODEL_SIZE=256M sudo -E ./setup-seaweedfs-lab.sh crds
+
+# 3. 禁用 AI 场景
+TEST_AI_MODEL=false sudo -E ./setup-seaweedfs-lab.sh crds
+```
+
+### CSI Driver (seaweedfs-node) 启动失败
+
+CSI 驱动参数不兼容会导致进程退出并打印 help 文本。
+
+```bash
+# 查看日志确认
+kubectl logs -l app=seaweedfs-node -c csi-seaweedfs-plugin | head -20
+
+# 常见原因: CSI driver 不支持 --cacheCapacityMB 或 --chunkSizeLimitMB
+# 这是 weed mount 的参数，不是 CSI driver 的参数
+# 修复: 确保 seaweedfs-csi.yaml 中 args 仅包含 CSI driver 支持的参数
+```
+
+### fio 脚本卡在等待挂载点
+
+`mountpoint` 命令在 Alpine 中属于 `util-linux` 包，不在 `coreutils` 中。镜像已包含 `util-linux`。同时脚本有 `stat` 设备 ID 和文件存在性双重回退检测。
+
+```bash
+# 检查挂载点是否真的就绪
+kubectl exec -l app=fio-storage -c fio-test -- sh -c "
+  mountpoint -q /mnt/nfs && echo 'nfs: mounted' || echo 'nfs: NOT mounted'
+  ls /mnt/image/basic_read.dat 2>/dev/null && echo 'image: ready' || echo 'image: NOT ready'
+"
+
+# ImageVolume 9s 快速超时，不阻塞其他测试
+```
+
+### NFS AI 大文件写入卡住
+
+NFS async 模式下脏页达到 `vm.dirty_bytes` 硬上限时会阻塞写入。
+
+```bash
+# 增大脏页上限 (临时)
+sudo sysctl -w vm.dirty_bytes=2147483648
+sudo sysctl -w vm.dirty_background_bytes=1073741824
+
+# 或通过 setup 脚本重部署 NFS 配置
+sudo ./setup-seaweedfs-lab.sh seaweedfs
+```
+
+### 重建 fio 镜像后 Pod 仍使用旧镜像
+
+K8s `imagePullPolicy: IfNotPresent` + 相同 tag → 永远不复用新镜像。
+
+```bash
+# 始终使用唯一 tag 构建
+TAG="local-$(date +%s)"
+sudo docker build -t seaweedfs-fio-test:$TAG -f docker/Dockerfile.fio docker/
+sudo kind load docker-image seaweedfs-fio-test:$TAG --name seaweedfs-lab
+sudo kubectl set image deployment/fio-storage-test fio-test=seaweedfs-fio-test:$TAG
+```
+
+### weed mount 启动失败
+
+`-chunkSizeLimitMB` 和 `-readAheadSize` 不是 weed mount 的有效参数（当前版本）。
+
+```bash
+# 查看 weed mount 日志确认
+tail -20 /mnt/seaweedfs/logs/mount.log
+
+# 有效参数: -filer, -dir, -cacheCapacityMB
+# 确保未传递不支持的参数
 ```
