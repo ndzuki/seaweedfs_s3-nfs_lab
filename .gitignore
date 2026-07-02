@@ -6,6 +6,7 @@ filerldb2/
 .csi-driver-patched.yaml
 .nfs_s3_rclone_template.yaml
 .nfs_s3_rclone_rendered.yaml
+.fio-report-ingress.yaml
 
 # fio 测试结果
 fio-results/
@@ -20,3 +21,5 @@ fio-results/
 *.swo
 findings.json
 filerldb2/
+CLAUDE.md
+.claude/
