@@ -237,16 +237,38 @@ S3 rclone (最慢):
 | 协议转换次数 | 0 | 0 | 1 (FUSE→gRPC) | 2 (FUSE→HTTP→S3) |
 | 适合场景 | 模型分发、静态资源 | 通用计算 / 高吞吐 | K8s 原生集成 | 跨平台 S3 兼容 |
 
-**实测数据参考 (本实验环境):**
+**实测数据参考 (本实验环境, 2026-07-02 测试):**
 
-| 存储后端 | 顺序写 | 顺序读 | 随机写(4k) | 随机读(4k) | AI 模型加载读 | 小文件 IOPS |
-|----------|--------|--------|------------|------------|---------------|-------------|
-| ImageVolume | — 🔒 | ~3300 MB/s | — 🔒 | ~160k IOPS | ~3300 MB/s | ~18k IOPS |
-| NFS | ~570 MB/s | ~650 MB/s | ~868 MB/s | ~160k IOPS | ~2500 MB/s | ~0 (NFS 缓存) |
-| CSI | ~50 MB/s | ~500 MB/s | ~200 MB/s | ~90k IOPS | ~1900 MB/s | ~17k IOPS |
-| S3 | ~1500 MB/s | ~1800 MB/s | ~150 MB/s | ~49k IOPS | ~900 MB/s | ~18k IOPS |
+> 主机: Intel Core Ultra 5 225H (14核), 30.8GB RAM, Arch Linux (kernel 7.0.14)
+> 挂载: /mnt/nfs (NFS v4.2 async 1M rsize/wsize), /mnt/s3 (rclone VFS full cache 2G), /mnt/s3_with_seaweedfs (CSI weed mount concurrentWriters=128), /mnt/image (ImageVolume 本地)
 
-> **结论**: ImageVolume 在只读场景（模型分发、静态资源）提供零拷贝最优解，适合 AI 推理、静态网站、配置文件分发。NFS 适合高吞吐读写和通用场景。CSI 适合 K8s 原生集成（PVC），S3 适合跨平台兼容但性能有折损。选择取决于业务对读写模式、性能和接口标准的需求。
+### 场景 1: 基础读写 (单文件 256M, 1 job)
+
+| 测试项 | 指标 | NFS | S3 | CSI | ImageVolume |
+|--------|------|-----|-----|------|-------------|
+| 顺序写 (1M) | 带宽 | 475 MB/s | **1369** MB/s | 50 MB/s | — 🔒 |
+| 顺序读 (1M) | 带宽 | **7801** MB/s | 1221 MB/s | 2284 MB/s | 4082 MB/s |
+| 随机写 (4k) | 带宽 | **848** MB/s | 167 MB/s | 47 MB/s | — 🔒 |
+| 随机读 (4k) | IOPS | **154k** | 48k | 87k | 24k |
+
+### 场景 2: 小文件 (2000×16k, 4 jobs)
+
+| 测试项 | 指标 | NFS | S3 | CSI | ImageVolume |
+|--------|------|-----|-----|------|-------------|
+| 随机读 | IOPS | ⏭ NFS缓存 | 17.4k | 17.1k | **35.9k** |
+| 随机写 | IOPS | ⏭ NFS缓存 | 9.7k | 3.2k | — 🔒 |
+| 混合rw(70/30) | 读 IOPS | ⏭ NFS缓存 | 7.0k | 2.5k | — 🔒 |
+
+### 场景 3: AI 大模型 (512M, 4 jobs)
+
+| 测试项 | 指标 | NFS | S3 | CSI | ImageVolume |
+|--------|------|-----|-----|------|-------------|
+| Checkpoint 保存 (4M) | 带宽 | **3737** MB/s | 1533 MB/s | 50 MB/s | — 🔒 |
+| 模型加载读 (4M) | 带宽 | 2502 MB/s | 884 MB/s | 1843 MB/s | **3236** MB/s |
+| 分布式读 (256k) | 带宽 | **2413** MB/s | 790 MB/s | 2258 MB/s | 1959 MB/s |
+| 日志写 (8k) | 带宽 | **2768** MB/s | 194 MB/s | 35 MB/s | — 🔒 |
+
+> **结论**: ImageVolume 在只读场景提供本地零拷贝最优解（小文件读 36k IOPS，模型加载 3.2 GB/s），适合 AI 推理、静态资源分发。NFS 在顺序读写和日志写场景大幅领先（async + 1M rsize/wsize），但小文件 O_RDONLY 受 NFS over FUSE 属性缓存影响不可用。CSI 顺序写受 weed mount FUSE 限制仅 50 MB/s（已开 rate 50m 限速），读性能中等。S3 顺序写 1.4 GB/s 意外领先（rclone VFS write-back cache 效应），但读性能因 HTTP 协议翻译开销偏低。
 
 ## ImageVolume 只读测试
 
